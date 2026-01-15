@@ -1,0 +1,276 @@
+
+import sys
+import subprocess
+import importlib
+
+# --- 자동 설치 유틸 ---
+def ensure_package(pkg, extras=None, module_name=None):
+    """
+    pkg: pip 패키지명 (예: 'qrcode')
+    extras: 선택적 extras (예: 'pil' -> qrcode[pil])
+    module_name: import 시 사용할 모듈명(패키지명과 다를 때 지정)
+    """
+    mod = module_name or pkg
+    try:
+        importlib.import_module(mod)
+    except ImportError:
+        to_install = pkg if not extras else f"{pkg}[{extras}]"
+        print(f"'{to_install}' 패키지를 설치합니다...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", to_install])
+        # 재시도 import
+        importlib.invalidate_caches()
+        importlib.import_module(mod)
+
+# 필요한 패키지 확보
+ensure_package("qrcode", extras="pil", module_name="qrcode")
+ensure_package("Pillow", module_name="PIL")
+
+import os
+import io
+import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
+import qrcode
+from qrcode.constants import ERROR_CORRECT_L, ERROR_CORRECT_M, ERROR_CORRECT_Q, ERROR_CORRECT_H
+
+
+class QRCodeApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("QR 코드 생성기")
+        self.geometry("680x540")
+        self.minsize(640, 520)
+
+        # 상태
+        self.current_image = None  # PIL Image
+        self.tk_preview = None     # ImageTk
+        self.dark_mode = False
+
+        # 스타일/테마
+        self.style = ttk.Style()
+        self._set_theme()
+
+        # 위젯 구성
+        self._build_widgets()
+
+    # ---------- 테마 ----------
+    def _set_theme(self):
+        # 기본 테마 선택
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+        if self.dark_mode:
+            bg = "#1f1f1f"
+            fg = "#e8e8e8"
+            entry_bg = "#2a2a2a"
+            accent = "#3a86ff"
+        else:
+            bg = "#f7f7f7"
+            fg = "#1a1a1a"
+            entry_bg = "#ffffff"
+            accent = "#2d6cdf"
+
+        self.configure(bg=bg)
+        self.style.configure("TLabel", background=bg, foreground=fg)
+        self.style.configure("TFrame", background=bg)
+        self.style.configure("TButton", background=accent, foreground="#ffffff")
+        self.style.map("TButton",
+                       background=[("active", "#2554b0")],
+                       foreground=[("disabled", "#cccccc")])
+
+        # ttk.Entry는 기본 스타일 변경이 제한적이므로 tk.Entry 사용 병행
+        self.entry_bg = entry_bg
+        self.entry_fg = fg
+        self.bg = bg
+        self.fg = fg
+
+    # ---------- UI ----------
+    def _build_widgets(self):
+        # 상단 입력 프레임
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=16, pady=(16, 8))
+
+        lbl = ttk.Label(top, text="링크/텍스트")
+        lbl.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.var_text = tk.StringVar()
+        self.entry = tk.Entry(top, textvariable=self.var_text, bg=self.entry_bg, fg=self.fg,
+                              relief="solid", bd=1, insertbackground=self.fg)
+        self.entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.entry.focus()
+
+        paste_btn = ttk.Button(top, text="붙여넣기", command=self._paste_clipboard)
+        paste_btn.grid(row=0, column=2)
+
+        top.columnconfigure(1, weight=1)
+
+        # 옵션 프레임
+        opt = ttk.Frame(self)
+        opt.pack(fill="x", padx=16, pady=8)
+
+        # 오류 정정
+        ttk.Label(opt, text="오류 정정:").grid(row=0, column=0, sticky="w")
+        self.var_ec = tk.StringVar(value="M")
+        ec_combo = ttk.Combobox(opt, textvariable=self.var_ec, state="readonly",
+                                values=["L (약 7%)", "M (약 15%)", "Q (약 25%)", "H (약 30%)"], width=14)
+        ec_combo.grid(row=0, column=1, padx=(8, 20), sticky="w")
+
+        # 박스 크기
+        ttk.Label(opt, text="박스 크기:").grid(row=0, column=2, sticky="w")
+        self.var_box = tk.IntVar(value=10)
+        box_spin = ttk.Spinbox(opt, from_=2, to=40, textvariable=self.var_box, width=6)
+        box_spin.grid(row=0, column=3, padx=(8, 20), sticky="w")
+
+        # 여백(border)
+        ttk.Label(opt, text="여백:").grid(row=0, column=4, sticky="w")
+        self.var_border = tk.IntVar(value=4)
+        border_spin = ttk.Spinbox(opt, from_=0, to=20, textvariable=self.var_border, width=6)
+        border_spin.grid(row=0, column=5, padx=(8, 20), sticky="w")
+
+        # 버튼들
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=16, pady=(0, 8))
+
+        generate_btn = ttk.Button(btns, text="QR 생성", command=self.generate_qr)
+        generate_btn.pack(side="left")
+
+        save_btn = ttk.Button(btns, text="이미지 저장", command=self.save_image)
+        save_btn.pack(side="left", padx=(8, 0))
+
+        clear_btn = ttk.Button(btns, text="지우기", command=self.clear_all)
+        clear_btn.pack(side="left", padx=(8, 0))
+
+        theme_btn = ttk.Button(btns, text="라이트/다크 전환", command=self.toggle_theme)
+        theme_btn.pack(side="right")
+
+        # 미리보기
+        preview_frame = ttk.LabelFrame(self, text="미리보기")
+        preview_frame.pack(fill="both", expand=True, padx=16, pady=(8, 16))
+
+        self.canvas = tk.Canvas(preview_frame, bg="#ffffff", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self._refresh_preview)
+
+        # 하단 상태바
+        self.status = tk.StringVar(value="준비됨")
+        status_bar = ttk.Label(self, textvariable=self.status, anchor="w")
+        status_bar.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
+
+    # ---------- 이벤트/핵심 로직 ----------
+    def _paste_clipboard(self):
+        try:
+            text = self.clipboard_get()
+            self.var_text.set(text)
+            self.status.set("클립보드에서 텍스트를 붙여넣었습니다.")
+        except Exception:
+            self.status.set("클립보드에 텍스트가 없습니다.")
+
+    def _ec_level(self):
+        val = self.var_ec.get().strip()[0].upper()
+        return {
+            "L": ERROR_CORRECT_L,
+            "M": ERROR_CORRECT_M,
+            "Q": ERROR_CORRECT_Q,
+            "H": ERROR_CORRECT_H,
+        }.get(val, ERROR_CORRECT_M)
+
+    def generate_qr(self):
+        data = self.var_text.get().strip()
+        if not data:
+            messagebox.showwarning("알림", "링크 또는 텍스트를 입력해 주세요.")
+            return
+
+        try:
+            qr = qrcode.QRCode(
+                version=None,  # 자동
+                error_correction=self._ec_level(),
+                box_size=max(2, int(self.var_box.get())),
+                border=max(0, int(self.var_border.get())),
+            )
+            qr.add_data(data)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            self.current_image = img
+            self.status.set("QR 코드가 생성되었습니다.")
+            self._refresh_preview()
+        except Exception as e:
+            messagebox.showerror("오류", f"QR 생성 중 문제가 발생했습니다:\n{e}")
+            self.status.set("오류 발생")
+
+    def _refresh_preview(self, event=None):
+        # canvas 크기에 맞게 미리보기 스케일링
+        if self.current_image is None:
+            self.canvas.delete("all")
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2,
+                self.canvas.winfo_height() // 2,
+                text="여기에 미리보기가 표시됩니다.",
+                fill="#888888",
+            )
+            return
+
+        c_w = max(1, self.canvas.winfo_width())
+        c_h = max(1, self.canvas.winfo_height())
+
+        # 여백을 주고 정사각형으로 맞춤
+        pad = 20
+        target = min(c_w, c_h) - pad * 2
+        if target < 20:
+            target = min(c_w, c_h)
+
+        img = self.current_image
+        # 비율 유지하여 리사이즈
+        img_resized = img.copy().resize((target, target), Image.NEAREST)
+
+        self.tk_preview = ImageTk.PhotoImage(img_resized)
+        self.canvas.delete("all")
+        x = (c_w - target) // 2
+        y = (c_h - target) // 2
+        self.canvas.create_image(x, y, anchor="nw", image=self.tk_preview)
+
+    def save_image(self):
+        if self.current_image is None:
+            messagebox.showinfo("알림", "먼저 QR 코드를 생성해 주세요.")
+            return
+
+        # 기본 파일명 제안: yyyy-mm-dd_HHMMSS_qr.png
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        default_name = f"{ts}_qr.png"
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG 이미지", "*.png"), ("모든 파일", "*.*")],
+            initialfile=default_name,
+            title="QR 이미지 저장"
+        )
+        if not file_path:
+            return
+
+        try:
+            # PNG로 저장 (투명 배경 원하면 back_color를 'white' 대신 'transparent'로 생성 단계에서 변경 가능)
+            self.current_image.save(file_path, format="PNG", optimize=True)
+            self.status.set(f"저장 완료: {os.path.basename(file_path)}")
+        except Exception as e:
+            messagebox.showerror("오류", f"저장 중 문제가 발생했습니다:\n{e}")
+            self.status.set("오류 발생")
+
+    def clear_all(self):
+        self.var_text.set("")
+        self.current_image = None
+        self._refresh_preview()
+        self.status.set("초기화했습니다.")
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self._set_theme()
+        # Entry 색상 즉시 반영
+        self.entry.configure(bg=self.entry_bg, fg=self.fg, insertbackground=self.fg)
+        self._refresh_preview()
+
+
+if __name__ == "__main__":
+    app = QRCodeApp()
+    app.mainloop()
